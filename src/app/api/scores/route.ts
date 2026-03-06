@@ -1,4 +1,4 @@
-import { kv } from "@vercel/kv";
+import { createClient } from "redis";
 import { NextRequest, NextResponse } from "next/server";
 
 export interface ScoreEntry {
@@ -11,19 +11,32 @@ export interface ScoreEntry {
 
 const SCORES_KEY = "snap-quiz-scores-2026";
 
+async function withRedis<T>(fn: (client: ReturnType<typeof createClient>) => Promise<T>): Promise<T> {
+  const client = createClient({ url: process.env.REDIS_URL });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.disconnect();
+  }
+}
+
 // GET: Fetch all scores (for leaderboard)
 export async function GET() {
   try {
-    const scores: ScoreEntry[] = (await kv.get<ScoreEntry[]>(SCORES_KEY)) || [];
+    const scores = await withRedis(async (client) => {
+      const data = await client.get(SCORES_KEY);
+      return data ? (JSON.parse(data) as ScoreEntry[]) : [];
+    });
     // Sort by score desc, then by time asc (faster = better)
     scores.sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return a.timeSeconds - b.timeSeconds;
     });
     return NextResponse.json({ scores });
-  } catch {
-    // If KV is not set up, return empty
-    return NextResponse.json({ scores: [], error: "KV not configured" });
+  } catch (err) {
+    console.error("GET /api/scores error:", err);
+    return NextResponse.json({ scores: [], error: "Redis not configured" });
   }
 }
 
@@ -45,15 +58,18 @@ export async function POST(request: NextRequest) {
       timestamp: Date.now(),
     };
 
-    const scores: ScoreEntry[] =
-      (await kv.get<ScoreEntry[]>(SCORES_KEY)) || [];
-    scores.push(entry);
-    await kv.set(SCORES_KEY, scores);
+    await withRedis(async (client) => {
+      const data = await client.get(SCORES_KEY);
+      const scores: ScoreEntry[] = data ? JSON.parse(data) : [];
+      scores.push(entry);
+      await client.set(SCORES_KEY, JSON.stringify(scores));
+    });
 
     return NextResponse.json({ success: true, entry });
-  } catch {
+  } catch (err) {
+    console.error("POST /api/scores error:", err);
     return NextResponse.json(
-      { error: "Failed to save score. Is Vercel KV configured?" },
+      { error: "Failed to save score. Is REDIS_URL configured?" },
       { status: 500 }
     );
   }
@@ -62,9 +78,12 @@ export async function POST(request: NextRequest) {
 // DELETE: Clear all scores (admin use)
 export async function DELETE() {
   try {
-    await kv.set(SCORES_KEY, []);
+    await withRedis(async (client) => {
+      await client.set(SCORES_KEY, JSON.stringify([]));
+    });
     return NextResponse.json({ success: true });
-  } catch {
+  } catch (err) {
+    console.error("DELETE /api/scores error:", err);
     return NextResponse.json({ error: "Failed to clear" }, { status: 500 });
   }
 }
